@@ -4,16 +4,19 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import shutil
 import subprocess
 import sys
 from collections import defaultdict
+from dataclasses import dataclass
 from pathlib import Path
 
 TOGGLE_INDEXED_PATTERN = re.compile(r"\[(\d+)\]:(0->1|1->0)$")
 TOGGLE_SCALAR_PATTERN = re.compile(r":(0->1|1->0)$")
+TRANSFORM_BASE_ARGS = ["info-process", "transform", "--normalize-paths", "--normalize-hit-counts"]
 
 
 def log(message: str) -> None:
@@ -30,6 +33,136 @@ def run_cmd(args: list[str]) -> None:
     subprocess.run(args, check=True)
 
 
+def parse_string_list_field(payload: dict[str, object], key: str) -> list[str]:
+    """Read an optional string-list field from JSON object with strict type checks."""
+    value = payload.get(key, [])
+    if value is None:
+        return []
+    if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+        print(
+            f"[ERROR] JSON field '{key}' must be a string array",
+            file=sys.stderr,
+            flush=True,
+        )
+        raise SystemExit(1)
+    return value
+
+
+def load_args_from_json(json_path: Path) -> list[str]:
+    """
+    Convert JSON input into flat CLI args.
+
+    Supported formats:
+    - list[str]: raw argv fragment
+    - object: {input_dats, dataset, sf_alias, exclude_sf}
+    """
+    try:
+        payload = json.loads(json_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        print(f"[ERROR] JSON args file not found: {json_path}", file=sys.stderr, flush=True)
+        raise SystemExit(1)
+    except OSError as exc:
+        print(f"[ERROR] Failed to read JSON args file {json_path}: {exc}", file=sys.stderr, flush=True)
+        raise SystemExit(1)
+    except json.JSONDecodeError as exc:
+        print(f"[ERROR] Invalid JSON in {json_path}: {exc}", file=sys.stderr, flush=True)
+        raise SystemExit(1)
+
+    if isinstance(payload, list):
+        if any(not isinstance(item, str) for item in payload):
+            print(
+                "[ERROR] JSON args array must contain only strings",
+                file=sys.stderr,
+                flush=True,
+            )
+            raise SystemExit(1)
+        return payload
+
+    if not isinstance(payload, dict):
+        print(
+            "[ERROR] JSON args must be either an argument string array or an object",
+            file=sys.stderr,
+            flush=True,
+        )
+        raise SystemExit(1)
+
+    allowed_keys = {"input_dats", "dataset", "sf_alias", "exclude_sf"}
+    unknown_keys = sorted(key for key in payload if key not in allowed_keys)
+    if unknown_keys:
+        print(
+            "[ERROR] Unsupported key(s) in JSON args: " + ", ".join(unknown_keys),
+            file=sys.stderr,
+            flush=True,
+        )
+        raise SystemExit(1)
+
+    args: list[str] = []
+    args.extend(parse_string_list_field(payload, "input_dats"))
+
+    dataset = payload.get("dataset")
+    if dataset is not None:
+        if not isinstance(dataset, str):
+            print("[ERROR] JSON field 'dataset' must be a string", file=sys.stderr, flush=True)
+            raise SystemExit(1)
+        args.extend(["--dataset", dataset])
+
+    for alias in parse_string_list_field(payload, "sf_alias"):
+        args.extend(["--sf-alias", alias])
+    for path in parse_string_list_field(payload, "exclude_sf"):
+        args.extend(["--exclude-sf", path])
+
+    return args
+
+
+def preprocess_argv_with_json(argv: list[str]) -> list[str]:
+    """Expand --args-json before normal argparse parsing."""
+    if "-h" in argv or "--help" in argv:
+        return argv
+
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--args-json", action="append", metavar="FILE")
+    parsed, filtered = parser.parse_known_args(argv)
+
+    json_paths = parsed.args_json or []
+    if len(json_paths) > 1:
+        print("[ERROR] --args-json can only be provided once", file=sys.stderr, flush=True)
+        raise SystemExit(1)
+    if not json_paths:
+        return filtered
+
+    json_args = load_args_from_json(Path(json_paths[0]))
+    if any(item == "--args-json" or item.startswith("--args-json=") for item in json_args):
+        print(
+            "[ERROR] Nested --args-json is not supported inside JSON args file",
+            file=sys.stderr,
+            flush=True,
+        )
+        raise SystemExit(1)
+
+    # JSON args are applied first so direct CLI flags can override them.
+    return json_args + filtered
+
+
+def normalize_coverage_path(path: str) -> str:
+    path = path.strip()
+    if not path:
+        return ""
+    return os.path.normpath(path)
+
+
+def rewrite_path_by_prefix(path: str, src: str, dst: str) -> str | None:
+    """Rewrite path when it equals src or is under src/ prefix."""
+    if not src:
+        return None
+    if path == src:
+        return dst
+    prefix = "/" if src == "/" else src + "/"
+    if path.startswith(prefix):
+        suffix = path[len(src) :]
+        return dst + suffix
+    return None
+
+
 def parse_sf_aliases(raw_aliases: list[str]) -> list[tuple[str, str]]:
     aliases: list[tuple[str, str]] = []
     for item in raw_aliases:
@@ -41,8 +174,8 @@ def parse_sf_aliases(raw_aliases: list[str]) -> list[tuple[str, str]]:
             )
             raise SystemExit(1)
         src, dst = item.split("=", 1)
-        src = src.strip()
-        dst = dst.strip()
+        src = normalize_coverage_path(src)
+        dst = normalize_coverage_path(dst)
         if not src:
             print(
                 f"[ERROR] Invalid --sf-alias '{item}', FROM cannot be empty",
@@ -59,14 +192,9 @@ def parse_sf_aliases(raw_aliases: list[str]) -> list[tuple[str, str]]:
 
 def rewrite_sf_path(path: str, aliases: list[tuple[str, str]]) -> str:
     for src, dst in aliases:
-        src_norm = src.rstrip("/")
-        dst_norm = dst.rstrip("/")
-        if path == src_norm:
-            return dst_norm
-        prefix = src_norm + "/"
-        if path.startswith(prefix):
-            suffix = path[len(src_norm) :]
-            return dst_norm + suffix
+        rewritten = rewrite_path_by_prefix(path, src, dst)
+        if rewritten is not None:
+            return rewritten
     return path
 
 
@@ -88,6 +216,88 @@ def apply_sf_aliases(info_file: Path, aliases: list[tuple[str, str]]) -> int:
                 output.append(line)
     info_file.write_text("".join(output), encoding="utf-8")
     return changed
+
+
+def parse_excluded_sf_paths(raw_paths: list[str]) -> list[str]:
+    parsed_paths: list[str] = []
+    for item in raw_paths:
+        parsed = normalize_coverage_path(item)
+        if not parsed:
+            print(
+                f"[ERROR] Invalid --exclude-sf '{item}', path cannot be empty",
+                file=sys.stderr,
+                flush=True,
+            )
+            raise SystemExit(1)
+        parsed_paths.append(parsed)
+
+    # Keep input order while removing duplicates.
+    return list(dict.fromkeys(parsed_paths))
+
+
+def expand_excluded_sf_paths(base_paths: list[str], aliases: list[tuple[str, str]]) -> set[str]:
+    """
+    Expand excludes through alias graph (both directions, transitively).
+
+    Example:
+      A->B and C->B, exclude C/foo.sv
+      => also exclude B/foo.sv and A/foo.sv.
+    """
+    expanded: set[str] = set()
+    for base in base_paths:
+        queue = [base]
+        seen = {base}
+        while queue:
+            current = queue.pop()
+            for src, dst in aliases:
+                for left, right in ((src, dst), (dst, src)):
+                    rewritten = rewrite_path_by_prefix(current, left, right)
+                    if rewritten is None or rewritten in seen:
+                        continue
+                    seen.add(rewritten)
+                    queue.append(rewritten)
+        expanded.update(seen)
+    return expanded
+
+
+def drop_excluded_sf_records(info_file: Path, excluded_paths: set[str]) -> tuple[int, int]:
+    """Remove whole LCOV records whose SF matches excluded_paths."""
+    if not excluded_paths:
+        return 0, 0
+
+    kept: list[str] = []
+    record: list[str] = []
+    current_sf = ""
+    removed_records = 0
+    removed_files: set[str] = set()
+
+    with info_file.open("r", encoding="utf-8") as file:
+        for line in file:
+            record.append(line)
+            if line.startswith("SF:"):
+                current_sf = normalize_coverage_path(line[3:])
+
+            if not line.startswith("end_of_record"):
+                continue
+
+            if current_sf and current_sf in excluded_paths:
+                removed_records += 1
+                removed_files.add(current_sf)
+            else:
+                kept.extend(record)
+
+            record = []
+            current_sf = ""
+
+    if record:
+        if current_sf and current_sf in excluded_paths:
+            removed_records += 1
+            removed_files.add(current_sf)
+        else:
+            kept.extend(record)
+
+    info_file.write_text("".join(kept), encoding="utf-8")
+    return removed_records, len(removed_files)
 
 
 def squash_duplicate_sf_headers(info_file: Path) -> tuple[int, int]:
@@ -124,6 +334,7 @@ def squash_duplicate_sf_headers(info_file: Path) -> tuple[int, int]:
 
 
 def export_coverage_info(input_dats: list[Path], output_info: Path, filter_type: str | None) -> None:
+    """Export .dat files to LCOV .info with optional Verilator filter."""
     args = ["verilator_coverage"]
     if filter_type is not None:
         args.extend(["--filter-type", filter_type])
@@ -132,11 +343,12 @@ def export_coverage_info(input_dats: list[Path], output_info: Path, filter_type:
 
 
 def collect_sf_paths(info_file: Path) -> list[str]:
+    """Collect normalized SF paths from an LCOV info file."""
     sf_paths: list[str] = []
     with info_file.open("r", encoding="utf-8") as file:
         for line in file:
             if line.startswith("SF:"):
-                path = os.path.normpath(line[3:].strip())
+                path = normalize_coverage_path(line[3:])
                 if path:
                     sf_paths.append(path)
     return sf_paths
@@ -151,6 +363,11 @@ def has_sf_records(info_file: Path) -> bool:
 
 
 def compute_path_rewrite(info_files: list[Path]) -> tuple[str, str]:
+    """
+    Compute --strip-file-prefix regex + sources root from all SF paths.
+
+    Returns empty strings when no safe common prefix exists.
+    """
     sf_paths: list[str] = []
     for info_file in info_files:
         sf_paths.extend(collect_sf_paths(info_file))
@@ -340,9 +557,22 @@ def ensure_lf_lh_summary(info_file: Path) -> None:
     info_file.write_text("".join(output), encoding="utf-8")
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    raw_argv = sys.argv[1:] if argv is None else argv
+    effective_argv = preprocess_argv_with_json(raw_argv)
+
     parser = argparse.ArgumentParser(
         description="Convert one or more Verilator coverage.dat files into a Coverview input archive."
+    )
+    parser.add_argument(
+        "--args-json",
+        default=None,
+        metavar="FILE",
+        help=(
+            "Load arguments from JSON file. Supports array form "
+            "['coverage.dat','--dataset','foo'] or object form "
+            "{input_dats,dataset,sf_alias,exclude_sf}."
+        ),
     )
     parser.add_argument(
         "input_dats",
@@ -365,7 +595,17 @@ def parse_args() -> argparse.Namespace:
             "When SF is FROM or starts with FROM/, it will be rewritten to TO."
         ),
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--exclude-sf",
+        action="append",
+        default=[],
+        metavar="PATH",
+        help=(
+            "Exclude the specified SF path from output coverage (repeatable). "
+            "When combined with --sf-alias, equivalent aliased paths are also excluded."
+        ),
+    )
+    return parser.parse_args(effective_argv)
 
 
 def resolve_inputs_and_dataset(args: argparse.Namespace) -> tuple[list[Path], str]:
@@ -399,42 +639,120 @@ def resolve_inputs_and_dataset(args: argparse.Namespace) -> tuple[list[Path], st
     return input_dats, dataset
 
 
+@dataclass(frozen=True)
+class OutputFiles:
+    raw_all_info: Path
+    raw_toggle_info: Path
+    raw_user_info: Path
+    line_info: Path
+    toggle_info: Path
+    user_info: Path
+    config_json: Path
+    output_zip: Path
+
+
+def build_output_files(dataset: str) -> OutputFiles:
+    return OutputFiles(
+        raw_all_info=Path(f"coverage_all_raw_{dataset}.info"),
+        raw_toggle_info=Path(f"coverage_toggle_raw_{dataset}.info"),
+        raw_user_info=Path(f"coverage_user_raw_{dataset}.info"),
+        line_info=Path(f"coverage_line_{dataset}.info"),
+        toggle_info=Path(f"coverage_toggle_{dataset}.info"),
+        user_info=Path(f"coverage_user_{dataset}.info"),
+        config_json=Path(f"coverview_config_{dataset}.json"),
+        output_zip=Path(f"coverview_data_{dataset}.zip"),
+    )
+
+
+def transform_info_file(info_file: Path, strip_regex: str, set_block_ids: bool = False) -> None:
+    """Run common info-process transform options on one coverage file."""
+    args = TRANSFORM_BASE_ARGS.copy()
+    if set_block_ids:
+        args.append("--set-block-ids")
+    if strip_regex:
+        args.extend(["--strip-file-prefix", strip_regex])
+    run_cmd(args + [str(info_file)])
+
+
+def apply_alias_and_exclusions(
+    info_file: Path,
+    coverage_label: str,
+    sf_aliases: list[tuple[str, str]],
+    excluded_sf_paths: set[str],
+    set_block_ids: bool = False,
+) -> None:
+    """Apply SF alias merge + SF exclusion to one normalized coverage file."""
+    if sf_aliases:
+        alias_hits = apply_sf_aliases(info_file, sf_aliases)
+        if alias_hits:
+            # Re-run transform after alias rewrite so info-process can merge records.
+            transform_info_file(info_file, strip_regex="", set_block_ids=set_block_ids)
+            dropped, mismatched = squash_duplicate_sf_headers(info_file)
+            log(
+                f"      applied SF aliases on {coverage_label} info (rewritten SF: {alias_hits}, "
+                f"dropped extra SF: {dropped}, mismatched: {mismatched})"
+            )
+        else:
+            log(f"      SF aliases configured for {coverage_label} info but no path matched")
+
+    if excluded_sf_paths:
+        removed_records, removed_files = drop_excluded_sf_records(info_file, excluded_sf_paths)
+        log(
+            f"      excluded {coverage_label} coverage records: {removed_records} "
+            f"(matched SF files: {removed_files})"
+        )
+
+
 def main() -> int:
     args = parse_args()
+
+    # Parse alias/exclude intent once, then reuse across line/toggle/user stages.
     sf_aliases = parse_sf_aliases(args.sf_alias)
+    excluded_sf_paths = expand_excluded_sf_paths(
+        parse_excluded_sf_paths(args.exclude_sf), sf_aliases
+    )
+    if excluded_sf_paths:
+        log(f"[0/9] Exclude SF paths: {len(excluded_sf_paths)} (after alias expansion)")
+        for path in sorted(excluded_sf_paths):
+            log(f"      - {path}")
 
     input_dats, dataset = resolve_inputs_and_dataset(args)
-    raw_all_info = Path(f"coverage_all_raw_{dataset}.info")
-    raw_toggle_info = Path(f"coverage_toggle_raw_{dataset}.info")
-    raw_user_info = Path(f"coverage_user_raw_{dataset}.info")
-    line_info = Path(f"coverage_line_{dataset}.info")
-    toggle_info = Path(f"coverage_toggle_{dataset}.info")
-    user_info = Path(f"coverage_user_{dataset}.info")
-    config_json = Path(f"coverview_config_{dataset}.json")
-    output_zip = Path(f"coverview_data_{dataset}.zip")
+    outputs = build_output_files(dataset)
 
     need_cmd("verilator_coverage")
     need_cmd("info-process")
 
-    log(f"[1/9] Export combined coverage from {len(input_dats)} dat file(s) -> {raw_all_info}")
-    export_coverage_info(input_dats, raw_all_info, filter_type=None)
+    # Stage 1: export raw LCOV data from Verilator.
+    log(
+        f"[1/9] Export combined coverage from {len(input_dats)} dat file(s) -> "
+        f"{outputs.raw_all_info}"
+    )
+    export_coverage_info(input_dats, outputs.raw_all_info, filter_type=None)
 
-    log(f"[2/9] Extract toggle coverage from {len(input_dats)} dat file(s) -> {raw_toggle_info}")
-    export_coverage_info(input_dats, raw_toggle_info, filter_type="toggle")
+    log(
+        f"[2/9] Extract toggle coverage from {len(input_dats)} dat file(s) -> "
+        f"{outputs.raw_toggle_info}"
+    )
+    export_coverage_info(input_dats, outputs.raw_toggle_info, filter_type="toggle")
 
-    log(f"[3/9] Extract user coverage from {len(input_dats)} dat file(s) -> {raw_user_info}")
-    export_coverage_info(input_dats, raw_user_info, filter_type="user")
-    has_user_coverage = has_sf_records(raw_user_info)
+    log(
+        f"[3/9] Extract user coverage from {len(input_dats)} dat file(s) -> "
+        f"{outputs.raw_user_info}"
+    )
+    export_coverage_info(input_dats, outputs.raw_user_info, filter_type="user")
+
+    # Stage 2: determine whether user coverage exists to avoid packing empty files.
+    has_user_coverage = has_sf_records(outputs.raw_user_info)
     if has_user_coverage:
-        log(f"      detected user coverage records, will include {user_info}")
+        log(f"      detected user coverage records, will include {outputs.user_info}")
     else:
         log("      no user coverage records in this run")
-        if user_info.exists():
-            user_info.unlink()
+        if outputs.user_info.exists():
+            outputs.user_info.unlink()
 
-    raw_info_files = [raw_all_info, raw_toggle_info]
+    raw_info_files = [outputs.raw_all_info, outputs.raw_toggle_info]
     if has_user_coverage:
-        raw_info_files.append(raw_user_info)
+        raw_info_files.append(outputs.raw_user_info)
 
     log("[4/9] Analyze SF paths for prefix stripping")
     strip_regex, sources_root = compute_path_rewrite(raw_info_files)
@@ -444,6 +762,7 @@ def main() -> int:
     else:
         log("      no stable common SF prefix found; keep original SF paths")
 
+    # Stage 3: line coverage pipeline.
     run_cmd(
         [
             "info-process",
@@ -451,127 +770,64 @@ def main() -> int:
             "--coverage-type",
             "line",
             "--output",
-            str(line_info),
-            str(raw_all_info),
+            str(outputs.line_info),
+            str(outputs.raw_all_info),
         ]
     )
-    line_transform_args = [
-        "info-process",
-        "transform",
-        "--normalize-paths",
-        "--normalize-hit-counts",
-    ]
-    if strip_regex:
-        line_transform_args.extend(["--strip-file-prefix", strip_regex])
-    log(f"[5/9] Normalize line coverage -> {line_info}")
-    run_cmd(line_transform_args + [str(line_info)])
-    if sf_aliases:
-        alias_hits = apply_sf_aliases(line_info, sf_aliases)
-        if alias_hits:
-            run_cmd(
-                [
-                    "info-process",
-                    "transform",
-                    "--normalize-paths",
-                    "--normalize-hit-counts",
-                    str(line_info),
-                ]
-            )
-            dropped, mismatched = squash_duplicate_sf_headers(line_info)
-            log(
-                f"      applied SF aliases on line info (rewritten SF: {alias_hits}, "
-                f"dropped extra SF: {dropped}, mismatched: {mismatched})"
-            )
-        else:
-            log("      SF aliases configured for line info but no path matched")
-    ensure_lf_lh_summary(line_info)
+    log(f"[5/9] Normalize line coverage -> {outputs.line_info}")
+    transform_info_file(outputs.line_info, strip_regex=strip_regex)
+    apply_alias_and_exclusions(
+        outputs.line_info,
+        coverage_label="line",
+        sf_aliases=sf_aliases,
+        excluded_sf_paths=excluded_sf_paths,
+    )
+    ensure_lf_lh_summary(outputs.line_info)
 
-    shutil.copyfile(raw_toggle_info, toggle_info)
+    # Stage 4: toggle coverage pipeline (with BRDA label rewrite).
+    shutil.copyfile(outputs.raw_toggle_info, outputs.toggle_info)
     toggle_name_map, mapping_conflicts = load_toggle_name_map(input_dats)
-    renamed, unresolved = rewrite_toggle_brda_names(toggle_info, toggle_name_map)
+    renamed, unresolved = rewrite_toggle_brda_names(outputs.toggle_info, toggle_name_map)
     log(
-        f"[6/9] Canonicalize toggle BRDA names in {toggle_info} "
+        f"[6/9] Canonicalize toggle BRDA names in {outputs.toggle_info} "
         f"(rewritten: {renamed}, unresolved: {unresolved}, conflicts: {mapping_conflicts})"
     )
-    toggle_transform_args = [
-        "info-process",
-        "transform",
-        "--normalize-paths",
-        "--normalize-hit-counts",
-        "--set-block-ids",
-    ]
-    if strip_regex:
-        toggle_transform_args.extend(["--strip-file-prefix", strip_regex])
-    log(f"[7/9] Normalize toggle coverage -> {toggle_info}")
-    run_cmd(
-        toggle_transform_args + [str(toggle_info)]
+    log(f"[7/9] Normalize toggle coverage -> {outputs.toggle_info}")
+    transform_info_file(outputs.toggle_info, strip_regex=strip_regex, set_block_ids=True)
+    apply_alias_and_exclusions(
+        outputs.toggle_info,
+        coverage_label="toggle",
+        sf_aliases=sf_aliases,
+        excluded_sf_paths=excluded_sf_paths,
+        set_block_ids=True,
     )
-    if sf_aliases:
-        alias_hits = apply_sf_aliases(toggle_info, sf_aliases)
-        if alias_hits:
-            run_cmd(
-                [
-                    "info-process",
-                    "transform",
-                    "--normalize-paths",
-                    "--normalize-hit-counts",
-                    "--set-block-ids",
-                    str(toggle_info),
-                ]
-            )
-            dropped, mismatched = squash_duplicate_sf_headers(toggle_info)
-            log(
-                f"      applied SF aliases on toggle info (rewritten SF: {alias_hits}, "
-                f"dropped extra SF: {dropped}, mismatched: {mismatched})"
-            )
-        else:
-            log("      SF aliases configured for toggle info but no path matched")
 
-    coverage_files = [line_info, toggle_info]
+    # Stage 5: optional user coverage pipeline.
+    coverage_files = [outputs.line_info, outputs.toggle_info]
     if has_user_coverage:
-        shutil.copyfile(raw_user_info, user_info)
-        user_transform_args = [
-            "info-process",
-            "transform",
-            "--normalize-paths",
-            "--normalize-hit-counts",
-        ]
-        if strip_regex:
-            user_transform_args.extend(["--strip-file-prefix", strip_regex])
-        log(f"[8/9] Normalize user coverage -> {user_info}")
-        run_cmd(user_transform_args + [str(user_info)])
-        if sf_aliases:
-            alias_hits = apply_sf_aliases(user_info, sf_aliases)
-            if alias_hits:
-                run_cmd(
-                    [
-                        "info-process",
-                        "transform",
-                        "--normalize-paths",
-                        "--normalize-hit-counts",
-                        str(user_info),
-                    ]
-                )
-                dropped, mismatched = squash_duplicate_sf_headers(user_info)
-                log(
-                    f"      applied SF aliases on user info (rewritten SF: {alias_hits}, "
-                    f"dropped extra SF: {dropped}, mismatched: {mismatched})"
-                )
-            else:
-                log("      SF aliases configured for user info but no path matched")
-        coverage_files.append(user_info)
+        shutil.copyfile(outputs.raw_user_info, outputs.user_info)
+        log(f"[8/9] Normalize user coverage -> {outputs.user_info}")
+        transform_info_file(outputs.user_info, strip_regex=strip_regex)
+        apply_alias_and_exclusions(
+            outputs.user_info,
+            coverage_label="user",
+            sf_aliases=sf_aliases,
+            excluded_sf_paths=excluded_sf_paths,
+        )
+        coverage_files.append(outputs.user_info)
     else:
         log("[8/9] Skip user coverage normalization (no user records)")
 
-    config_json.write_text("{}\n", encoding="utf-8")
+    # Stage 6: pack Coverview archive.
+    outputs.config_json.write_text("{}\n", encoding="utf-8")
 
     pack_args = [
         "info-process",
         "pack",
         "--output",
-        str(output_zip),
+        str(outputs.output_zip),
         "--config",
-        str(config_json),
+        str(outputs.config_json),
         "--coverage-files",
         *(str(path) for path in coverage_files),
         "--generate-tables",
@@ -580,10 +836,10 @@ def main() -> int:
     if sources_root:
         pack_args.extend(["--sources-root", sources_root])
 
-    log(f"[9/9] Pack Coverview archive -> {output_zip}")
+    log(f"[9/9] Pack Coverview archive -> {outputs.output_zip}")
     run_cmd(pack_args)
 
-    log(f"[OK] Done. Import {output_zip} into Coverview.")
+    log(f"[OK] Done. Import {outputs.output_zip} into Coverview.")
     return 0
 
 
