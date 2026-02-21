@@ -50,11 +50,10 @@ def parse_string_list_field(payload: dict[str, object], key: str) -> list[str]:
 
 def load_args_from_json(json_path: Path) -> list[str]:
     """
-    Convert JSON input into flat CLI args.
+    Convert JSON object into flat CLI args.
 
-    Supported formats:
-    - list[str]: raw argv fragment
-    - object: {input_dats, dataset, sf_alias, exclude_sf}
+    Supported schema:
+    {input_dats, dataset, sf_alias, exclude_sf}
     """
     try:
         payload = json.loads(json_path.read_text(encoding="utf-8"))
@@ -68,19 +67,10 @@ def load_args_from_json(json_path: Path) -> list[str]:
         print(f"[ERROR] Invalid JSON in {json_path}: {exc}", file=sys.stderr, flush=True)
         raise SystemExit(1)
 
-    if isinstance(payload, list):
-        if any(not isinstance(item, str) for item in payload):
-            print(
-                "[ERROR] JSON args array must contain only strings",
-                file=sys.stderr,
-                flush=True,
-            )
-            raise SystemExit(1)
-        return payload
-
     if not isinstance(payload, dict):
         print(
-            "[ERROR] JSON args must be either an argument string array or an object",
+            "[ERROR] JSON args must be an object with keys: "
+            "input_dats, dataset, sf_alias, exclude_sf",
             file=sys.stderr,
             flush=True,
         )
@@ -569,8 +559,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         metavar="FILE",
         help=(
-            "Load arguments from JSON file. Supports array form "
-            "['coverage.dat','--dataset','foo'] or object form "
+            "Load arguments from JSON object file with keys "
             "{input_dats,dataset,sf_alias,exclude_sf}."
         ),
     )
