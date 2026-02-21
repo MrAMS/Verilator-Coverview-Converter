@@ -4,7 +4,7 @@
 
 ![](screenshots/p2.webp)
 
-`convert_coverage_to_coverview.py` converts one or more [Verilator](https://www.veripool.org/verilator/) `coverage.dat` files into a [Coverview](https://github.com/antmicro/coverview)-ready `.zip` package.
+Converts one or more [Verilator](https://www.veripool.org/verilator/) `coverage.dat` files into a [Coverview](https://github.com/antmicro/coverview)-ready `.zip` package for visualization.
 
 It supports:
 - merging multiple test runs,
