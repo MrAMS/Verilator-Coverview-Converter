@@ -163,3 +163,4 @@ This guarantees that excluding a file in one equivalent run layout also excludes
 - If no user coverage is present, `coverage_user_<dataset>.info` is not packed.
 - Warnings about missing test description files come from `info-process pack`; they are expected when no `tests_*.desc` files are provided.
 - A legacy compatibility mode is kept: if dataset is omitted and the last positional token looks like a dataset (not an existing `.dat` path), it is treated as dataset name.
+- Check [Generating interactive coverage dashboards with Coverview](https://antmicro.com/blog/2025/03/interactive-coverage-dashboards-with-coverview) for further reading.
