@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import json
 import os
 import re
@@ -12,6 +13,7 @@ import subprocess
 import sys
 from collections import defaultdict
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 
 TOGGLE_INDEXED_PATTERN = re.compile(r"\[(\d+)\]:(0->1|1->0)$")
@@ -53,7 +55,7 @@ def load_args_from_json(json_path: Path) -> list[str]:
     Convert JSON object into flat CLI args.
 
     Supported schema:
-    {input_dats, dataset, sf_alias, exclude_sf}
+    {input_dats, dataset, dats_root, sf_alias, exclude_sf}
     """
     try:
         payload = json.loads(json_path.read_text(encoding="utf-8"))
@@ -70,13 +72,13 @@ def load_args_from_json(json_path: Path) -> list[str]:
     if not isinstance(payload, dict):
         print(
             "[ERROR] JSON args must be an object with keys: "
-            "input_dats, dataset, sf_alias, exclude_sf",
+            "input_dats, dataset, dats_root, sf_alias, exclude_sf",
             file=sys.stderr,
             flush=True,
         )
         raise SystemExit(1)
 
-    allowed_keys = {"input_dats", "dataset", "sf_alias", "exclude_sf"}
+    allowed_keys = {"input_dats", "dataset", "dats_root", "sf_alias", "exclude_sf"}
     unknown_keys = sorted(key for key in payload if key not in allowed_keys)
     if unknown_keys:
         print(
@@ -95,6 +97,13 @@ def load_args_from_json(json_path: Path) -> list[str]:
             print("[ERROR] JSON field 'dataset' must be a string", file=sys.stderr, flush=True)
             raise SystemExit(1)
         args.extend(["--dataset", dataset])
+
+    dats_root = payload.get("dats_root")
+    if dats_root is not None:
+        if not isinstance(dats_root, str):
+            print("[ERROR] JSON field 'dats_root' must be a string", file=sys.stderr, flush=True)
+            raise SystemExit(1)
+        args.extend(["--dats-root", dats_root])
 
     for alias in parse_string_list_field(payload, "sf_alias"):
         args.extend(["--sf-alias", alias])
@@ -140,10 +149,54 @@ def normalize_coverage_path(path: str) -> str:
     return os.path.normpath(path)
 
 
-def rewrite_path_by_prefix(path: str, src: str, dst: str) -> str | None:
-    """Rewrite path when it equals src or is under src/ prefix."""
-    if not src:
+@lru_cache(maxsize=512)
+def compile_wildcard_prefix_regex(pattern: str) -> re.Pattern[str]:
+    """Compile '*' wildcard prefix pattern with an optional '/...' tail."""
+    fragments: list[str] = []
+    wildcard_idx = 0
+    for char in pattern:
+        if char == "*":
+            fragments.append(f"(?P<w{wildcard_idx}>.*)")
+            wildcard_idx += 1
+        else:
+            fragments.append(re.escape(char))
+    return re.compile("^" + "".join(fragments) + "(?P<tail>/.*)?$")
+
+
+def apply_wildcard_template(template: str, values: list[str]) -> str | None:
+    """Replace '*' in template with captured wildcard values in order."""
+    output: list[str] = []
+    value_idx = 0
+    for char in template:
+        if char == "*":
+            if value_idx >= len(values):
+                return None
+            output.append(values[value_idx])
+            value_idx += 1
+        else:
+            output.append(char)
+    return "".join(output)
+
+
+def rewrite_path_by_wildcard_prefix(path: str, src: str, dst: str) -> str | None:
+    """Rewrite path with wildcard-aware prefix mapping."""
+    if "*" not in src:
         return None
+
+    matched = compile_wildcard_prefix_regex(src).match(path)
+    if matched is None:
+        return None
+
+    wildcard_values = [matched.group(f"w{idx}") for idx in range(src.count("*"))]
+    rewritten_prefix = apply_wildcard_template(dst, wildcard_values)
+    if rewritten_prefix is None:
+        return None
+
+    tail = matched.group("tail") or ""
+    return normalize_coverage_path(rewritten_prefix + tail)
+
+
+def rewrite_path_by_exact_prefix(path: str, src: str, dst: str) -> str | None:
     if path == src:
         return dst
     prefix = "/" if src == "/" else src + "/"
@@ -151,6 +204,33 @@ def rewrite_path_by_prefix(path: str, src: str, dst: str) -> str | None:
         suffix = path[len(src) :]
         return dst + suffix
     return None
+
+
+def rewrite_path_by_prefix(path: str, src: str, dst: str) -> str | None:
+    """Rewrite path when it equals src or is under src/ prefix."""
+    if not src:
+        return None
+
+    wildcard_rewritten = rewrite_path_by_wildcard_prefix(path, src, dst)
+    if wildcard_rewritten is not None:
+        return wildcard_rewritten
+
+    return rewrite_path_by_exact_prefix(path, src, dst)
+
+
+def matches_excluded_pattern(path: str, pattern: str) -> bool:
+    """
+    Match one SF path against an exclude pattern.
+
+    Supports both exact string matches and '*' wildcard matches.
+    """
+    normalized_path = normalize_coverage_path(path)
+    normalized_pattern = normalize_coverage_path(pattern)
+
+    if "*" in normalized_pattern:
+        return fnmatch.fnmatchcase(normalized_path, normalized_pattern)
+
+    return normalized_path == normalized_pattern
 
 
 def parse_sf_aliases(raw_aliases: list[str]) -> list[tuple[str, str]]:
@@ -173,10 +253,19 @@ def parse_sf_aliases(raw_aliases: list[str]) -> list[tuple[str, str]]:
                 flush=True,
             )
             raise SystemExit(1)
+        src_wildcards = src.count("*")
+        dst_wildcards = dst.count("*")
+        if src_wildcards != dst_wildcards:
+            print(
+                f"[ERROR] Invalid --sf-alias '{item}', wildcard count must match on both sides",
+                file=sys.stderr,
+                flush=True,
+            )
+            raise SystemExit(1)
         aliases.append((src, dst))
 
-    # Prefer the longest source prefix first, so specific rules win.
-    aliases.sort(key=lambda pair: len(pair[0]), reverse=True)
+    # Prefer more specific source patterns first (longer non-wildcard text wins).
+    aliases.sort(key=lambda pair: len(pair[0].replace("*", "")), reverse=True)
     return aliases
 
 
@@ -255,6 +344,7 @@ def drop_excluded_sf_records(info_file: Path, excluded_paths: set[str]) -> tuple
     if not excluded_paths:
         return 0, 0
 
+    patterns = sorted(excluded_paths)
     kept: list[str] = []
     record: list[str] = []
     current_sf = ""
@@ -270,7 +360,12 @@ def drop_excluded_sf_records(info_file: Path, excluded_paths: set[str]) -> tuple
             if not line.startswith("end_of_record"):
                 continue
 
-            if current_sf and current_sf in excluded_paths:
+            if (
+                current_sf
+                and any(
+                    matches_excluded_pattern(current_sf, pattern) for pattern in patterns
+                )
+            ):
                 removed_records += 1
                 removed_files.add(current_sf)
             else:
@@ -280,7 +375,10 @@ def drop_excluded_sf_records(info_file: Path, excluded_paths: set[str]) -> tuple
             current_sf = ""
 
     if record:
-        if current_sf and current_sf in excluded_paths:
+        if (
+            current_sf
+            and any(matches_excluded_pattern(current_sf, pattern) for pattern in patterns)
+        ):
             removed_records += 1
             removed_files.add(current_sf)
         else:
@@ -560,7 +658,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         metavar="FILE",
         help=(
             "Load arguments from JSON object file with keys "
-            "{input_dats,dataset,sf_alias,exclude_sf}."
+            "{input_dats,dataset,dats_root,sf_alias,exclude_sf}."
         ),
     )
     parser.add_argument(
@@ -575,13 +673,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Dataset name for output files (default: verilator).",
     )
     parser.add_argument(
+        "--dats-root",
+        default=None,
+        metavar="DIR",
+        help=(
+            "Optional common prefix for input dat paths. "
+            "Relative input_dats are resolved under this directory."
+        ),
+    )
+    parser.add_argument(
         "--sf-alias",
         action="append",
         default=[],
         metavar="FROM=TO",
         help=(
             "Map equivalent source paths (can be repeated). "
-            "When SF is FROM or starts with FROM/, it will be rewritten to TO."
+            "When SF is FROM or starts with FROM/, it will be rewritten to TO. "
+            "Supports '*' wildcard (same count required on both sides)."
         ),
     )
     parser.add_argument(
@@ -591,31 +699,29 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         metavar="PATH",
         help=(
             "Exclude the specified SF path from output coverage (repeatable). "
-            "When combined with --sf-alias, equivalent aliased paths are also excluded."
+            "Supports '*' wildcard. When combined with --sf-alias, "
+            "equivalent aliased paths are also excluded."
         ),
     )
     return parser.parse_args(effective_argv)
 
 
+def resolve_input_dat_path(raw_path: str, dats_root: Path | None) -> Path:
+    path = Path(raw_path)
+    if dats_root is not None and not path.is_absolute():
+        return dats_root / path
+    return path
+
+
 def resolve_inputs_and_dataset(args: argparse.Namespace) -> tuple[list[Path], str]:
     raw_inputs: list[str] = args.input_dats[:] if args.input_dats else ["coverage.dat"]
     dataset = args.dataset
-
-    # Backward compatibility: old form was "<input_dat> <dataset>".
-    if dataset is None and len(raw_inputs) >= 2:
-        maybe_dataset = raw_inputs[-1]
-        maybe_path = Path(maybe_dataset)
-        maybe_dataset_like = "/" not in maybe_dataset and not maybe_dataset.endswith(".dat")
-        if maybe_dataset_like and not maybe_path.exists():
-            prev_inputs = [Path(p) for p in raw_inputs[:-1]]
-            if all(path.is_file() for path in prev_inputs):
-                dataset = maybe_dataset
-                raw_inputs = raw_inputs[:-1]
+    dats_root = Path(args.dats_root).expanduser() if args.dats_root else None
 
     if dataset is None:
         dataset = "verilator"
 
-    input_dats = [Path(path) for path in raw_inputs]
+    input_dats = [resolve_input_dat_path(path, dats_root) for path in raw_inputs]
     missing = [path for path in input_dats if not path.is_file()]
     if missing:
         print(

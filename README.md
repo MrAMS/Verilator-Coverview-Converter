@@ -47,6 +47,7 @@ Import the generated `coverview_data_<dataset>.zip` into Coverview.
 
 ```text
 usage: convert_coverage_to_coverview.py [-h] [--args-json FILE] [-d DATASET]
+                                        [--dats-root DIR]
                                         [--sf-alias FROM=TO]
                                         [--exclude-sf PATH]
                                         [input_dats ...]
@@ -61,13 +62,19 @@ usage: convert_coverage_to_coverview.py [-h] [--args-json FILE] [-d DATASET]
   - Dataset suffix for output files.
   - Default: `verilator`.
 
+- `--dats-root DIR`
+  - Optional common prefix for `input_dats`.
+  - Any relative `input_dats` path is resolved as `DIR/<input_dat>`.
+
 - `--sf-alias FROM=TO` (repeatable)
   - Rewrites LCOV `SF:` paths from `FROM` prefix to `TO` prefix.
   - Useful when different test runs compile the same sources under different run directories.
+  - Supports wildcard `*` (number of `*` must match between `FROM` and `TO`).
 
 - `--exclude-sf PATH` (repeatable)
   - Removes all coverage records whose `SF:` equals the given path.
   - Alias-aware: when used with `--sf-alias`, exclusion is expanded transitively across equivalent paths.
+  - Supports wildcard `*`.
 
 - `--args-json FILE`
   - Loads arguments from JSON, then applies normal CLI arguments (CLI can override JSON).
@@ -77,19 +84,31 @@ usage: convert_coverage_to_coverview.py [-h] [--args-json FILE] [-d DATASET]
 Use a single JSON object with these keys:
 - `input_dats` (string array)
 - `dataset` (string, optional)
+- `dats_root` (string, optional)
 - `sf_alias` (string array, optional)
 - `exclude_sf` (string array, optional)
 
 ```json
 {
-  "input_dats": ["and/coverage.dat", "or/coverage.dat", "xor/coverage.dat"],
-  "dataset": "and_or_xor",
+  "dats_root": "/path/to/bazel-testlogs/project/ru",
+  "input_dats": [
+    "TestLogicRU/test.outputs/chiselsim/TestLogicRU/LogicRU.AND/random-stream/workdir-verilator/coverage.dat",
+    "TestLogicRU/test.outputs/chiselsim/TestLogicRU/LogicRU.OR/random-stream/workdir-verilator/coverage.dat",
+    "TestLogicRU/test.outputs/chiselsim/TestLogicRU/LogicRU.XOR/random-stream/workdir-verilator/coverage.dat",
+    "TestRangeRU/test.outputs/chiselsim/TestRangeRU/RangeRU.Max/random-stream/workdir-verilator/coverage.dat",
+    "TestRangeRU/test.outputs/chiselsim/TestRangeRU/RangeRU.Min/random-stream/workdir-verilator/coverage.dat",
+    "TestAccRU/test.outputs/chiselsim/TestAccRU/AccRU/random-stream/workdir-verilator/coverage.dat"
+  ],
+  "dataset": "ru_suite",
   "sf_alias": [
-    "ALU.OR/random-stream=ALU.AND/random-stream",
-    "ALU.XOR/random-stream=ALU.AND/random-stream"
+    "*/chiselsim/TestLogicRU/LogicRU.OR/random-stream=*/chiselsim/TestLogicRU/LogicRU.AND/random-stream",
+    "*/chiselsim/TestLogicRU/LogicRU.XOR/random-stream=*/chiselsim/TestLogicRU/LogicRU.AND/random-stream",
+    "*/chiselsim/TestRangeRU/RangeRU.Min/random-stream=*/chiselsim/TestRangeRU/RangeRU.Max/random-stream"
   ],
   "exclude_sf": [
-    "ALU.OR/random-stream/primary-sources/DUT.sv"
+    "*/chiselsim/TestLogicRU/LogicRU.AND/random-stream/generated-sources/testbench.sv",
+    "*/chiselsim/TestRangeRU/RangeRU.Max/random-stream/generated-sources/testbench.sv",
+    "*/chiselsim/TestAccRU/AccRU/random-stream/generated-sources/testbench.sv"
   ]
 }
 ```
@@ -97,7 +116,7 @@ Use a single JSON object with these keys:
 Example run:
 
 ```bash
-./convert_coverage_to_coverview.py --args-json coverage_args_and_or_xor_alias_exclude.json
+./convert_coverage_to_coverview.py --args-json coverage_args_ru_suite.json
 ```
 
 ## Outputs
@@ -151,6 +170,12 @@ For dataset `<name>`, the script generates:
 
 When aliases exist, exclusions are expanded through the alias graph in both directions and transitively.
 
+For Bazel users: `SF:` paths can differ between `test.outputs/chiselsim/...` and
+`*_launcher.sh.runfiles/_main/build/chiselsim/...`. Use wildcard-based aliases
+or excludes when you need to match both layouts, e.g.:
+- `--sf-alias '*/chiselsim/TestLogicRU/LogicRU.OR/random-stream=*/chiselsim/TestLogicRU/LogicRU.AND/random-stream'`
+- `--exclude-sf '*/chiselsim/TestLogicRU/LogicRU.AND/random-stream/generated-sources/testbench.sv'`
+
 Example:
 - aliases: `A -> B`, `C -> B`
 - exclude: `C/foo.sv`
@@ -162,5 +187,4 @@ This guarantees that excluding a file in one equivalent run layout also excludes
 
 - If no user coverage is present, `coverage_user_<dataset>.info` is not packed.
 - Warnings about missing test description files come from `info-process pack`; they are expected when no `tests_*.desc` files are provided.
-- A legacy compatibility mode is kept: if dataset is omitted and the last positional token looks like a dataset (not an existing `.dat` path), it is treated as dataset name.
 - Check [Generating interactive coverage dashboards with Coverview](https://antmicro.com/blog/2025/03/interactive-coverage-dashboards-with-coverview) for further reading.
