@@ -1,9 +1,36 @@
-*
-!*/
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*.so
 
-!.gitignore
-!*.py
-!README.md
-!pyproject.toml
-!uv.lock
-!screenshots/
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Tool caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+.env
+.env.*
+
+# Editor/OS junk
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Project-generated coverage outputs
+coverage_*.info
+coverview_config_*.json
+coverview_data_*.zip
+
+# Local/private config
+args.yaml
+AGENT.md

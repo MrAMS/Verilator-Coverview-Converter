@@ -1,7 +1,19 @@
+[build-system]
+requires = ["hatchling>=1.27.0"]
+build-backend = "hatchling.build"
+
 [project]
 name = "verilator-coverage-with-coverview"
 version = "0.1.0"
+description = "Convert Verilator coverage.dat files into Coverview-ready archives."
+readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "pyyaml>=6.0.3",
 ]
+
+[project.scripts]
+convert-coverage-to-coverview = "verilator_coverage_with_coverview.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/verilator_coverage_with_coverview"]

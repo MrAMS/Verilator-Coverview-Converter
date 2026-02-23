@@ -1,4 +1,4 @@
-# Verilator Coverage Conversion Script for Coverview Visualization
+# Verilator Coverage Converter for Coverview Visualization
 
 ![](screenshots/p1.webp)
 
@@ -25,18 +25,29 @@ Python: `3.10+` (uses modern type hints)
 
 Coverview: tested on [coverview@15386d3](https://github.com/antmicro/coverview/commit/15386d3b85712ab69e3a34cbc8a1ddd579cb14ad)
 
+## Project Layout
+
+The converter is organized as a standard `uv`/Python package under `src/`:
+
+- `src/verilator_coverage_with_coverview/args_config.py`: CLI + YAML argument loading.
+- `src/verilator_coverage_with_coverview/path_alias.py`: path aliasing, wildcard rewrite, exclusion expansion.
+- `src/verilator_coverage_with_coverview/lcov.py`: LCOV export/transform/filter helpers.
+- `src/verilator_coverage_with_coverview/toggle_labels.py`: toggle label extraction and BRDA rename.
+- `src/verilator_coverage_with_coverview/pipeline.py`: end-to-end conversion pipeline.
+- `src/verilator_coverage_with_coverview/cli.py`: CLI entrypoint (`convert-coverage-to-coverview`).
+
 ## Quick Start
 
 Run in a directory that contains `coverage.dat`:
 
 ```bash
-uv run ./convert_coverage_to_coverview.py coverage.dat
+uv run convert-coverage-to-coverview coverage.dat
 ```
 
 Merge three runs:
 
 ```bash
-uv run ./convert_coverage_to_coverview.py \
+uv run convert-coverage-to-coverview \
   and/coverage.dat \
   or/coverage.dat \
   xor/coverage.dat \
@@ -48,11 +59,11 @@ Import the generated `coverview_data_<dataset>.zip` into Coverview.
 ## Command-Line Interface
 
 ```text
-usage: convert_coverage_to_coverview.py [-h] [--args-yaml FILE] [-d DATASET]
-                                        [--dats-root DIR]
-                                        [--sf-alias FROM=TO]
-                                        [--exclude-sf PATH]
-                                        [input_dats ...]
+usage: convert-coverage-to-coverview [-h] [--args-yaml FILE] [-d DATASET]
+                                     [--dats-root DIR]
+                                     [--sf-alias FROM=TO]
+                                     [--exclude-sf PATH]
+                                     [input_dats ...]
 ```
 
 ### Positional arguments
@@ -115,7 +126,7 @@ exclude_sf:
 Example run:
 
 ```bash
-uv run ./convert_coverage_to_coverview.py --args-yaml args.yaml
+uv run convert-coverage-to-coverview --args-yaml args.yaml
 ```
 
 ## Outputs
