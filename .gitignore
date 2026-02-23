@@ -4,4 +4,6 @@
 !.gitignore
 !*.py
 !README.md
+!pyproject.toml
+!uv.lock
 !screenshots/

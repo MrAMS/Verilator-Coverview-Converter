@@ -11,7 +11,7 @@ It supports:
 - line/toggle/user coverage extraction,
 - source path aliasing across equivalent test directories,
 - excluding selected source files from coverage,
-- loading arguments from JSON.
+- loading arguments from YAML.
 
 ## Requirements
 
@@ -20,6 +20,8 @@ The script requires these tools in `PATH`:
 - `info-process` (tested on [info-process@4c661cd](https://github.com/antmicro/info-process/commit/4c661cd6cb18df8ecfab7118cc0acbf4218b302a))
 
 Python: `3.10+` (uses modern type hints)
+- Use `uv` to manage environment and Python dependencies in this repo.
+- Run `uv sync` once before first use.
 
 Coverview: tested on [coverview@15386d3](https://github.com/antmicro/coverview/commit/15386d3b85712ab69e3a34cbc8a1ddd579cb14ad)
 
@@ -28,13 +30,13 @@ Coverview: tested on [coverview@15386d3](https://github.com/antmicro/coverview/c
 Run in a directory that contains `coverage.dat`:
 
 ```bash
-./convert_coverage_to_coverview.py coverage.dat
+uv run ./convert_coverage_to_coverview.py coverage.dat
 ```
 
 Merge three runs:
 
 ```bash
-./convert_coverage_to_coverview.py \
+uv run ./convert_coverage_to_coverview.py \
   and/coverage.dat \
   or/coverage.dat \
   xor/coverage.dat \
@@ -46,7 +48,7 @@ Import the generated `coverview_data_<dataset>.zip` into Coverview.
 ## Command-Line Interface
 
 ```text
-usage: convert_coverage_to_coverview.py [-h] [--args-json FILE] [-d DATASET]
+usage: convert_coverage_to_coverview.py [-h] [--args-yaml FILE] [-d DATASET]
                                         [--dats-root DIR]
                                         [--sf-alias FROM=TO]
                                         [--exclude-sf PATH]
@@ -76,47 +78,44 @@ usage: convert_coverage_to_coverview.py [-h] [--args-json FILE] [-d DATASET]
   - Alias-aware: when used with `--sf-alias`, exclusion is expanded transitively across equivalent paths.
   - Supports wildcard `*`.
 
-- `--args-json FILE`
-  - Loads arguments from JSON, then applies normal CLI arguments (CLI can override JSON).
+- `--args-yaml FILE`
+  - Loads arguments from YAML, then applies normal CLI arguments (CLI can override file values).
 
-## JSON Argument File
+## YAML Argument File
 
-Use a single JSON object with these keys:
+Use a single YAML mapping with these keys:
 - `input_dats` (string array)
 - `dataset` (string, optional)
 - `dats_root` (string, optional)
 - `sf_alias` (string array, optional)
 - `exclude_sf` (string array, optional)
 
-```json
-{
-  "dats_root": "/path/to/bazel-testlogs/project/ru",
-  "input_dats": [
-    "TestLogicRU/test.outputs/chiselsim/TestLogicRU/LogicRU.AND/random-stream/workdir-verilator/coverage.dat",
-    "TestLogicRU/test.outputs/chiselsim/TestLogicRU/LogicRU.OR/random-stream/workdir-verilator/coverage.dat",
-    "TestLogicRU/test.outputs/chiselsim/TestLogicRU/LogicRU.XOR/random-stream/workdir-verilator/coverage.dat",
-    "TestRangeRU/test.outputs/chiselsim/TestRangeRU/RangeRU.Max/random-stream/workdir-verilator/coverage.dat",
-    "TestRangeRU/test.outputs/chiselsim/TestRangeRU/RangeRU.Min/random-stream/workdir-verilator/coverage.dat",
-    "TestAccRU/test.outputs/chiselsim/TestAccRU/AccRU/random-stream/workdir-verilator/coverage.dat"
-  ],
-  "dataset": "ru_suite",
-  "sf_alias": [
-    "*/chiselsim/TestLogicRU/LogicRU.OR/random-stream=*/chiselsim/TestLogicRU/LogicRU.AND/random-stream",
-    "*/chiselsim/TestLogicRU/LogicRU.XOR/random-stream=*/chiselsim/TestLogicRU/LogicRU.AND/random-stream",
-    "*/chiselsim/TestRangeRU/RangeRU.Min/random-stream=*/chiselsim/TestRangeRU/RangeRU.Max/random-stream"
-  ],
-  "exclude_sf": [
-    "*/chiselsim/TestLogicRU/LogicRU.AND/random-stream/generated-sources/testbench.sv",
-    "*/chiselsim/TestRangeRU/RangeRU.Max/random-stream/generated-sources/testbench.sv",
-    "*/chiselsim/TestAccRU/AccRU/random-stream/generated-sources/testbench.sv"
-  ]
-}
+File extension is not enforced; only YAML content is accepted.
+
+```yaml
+dats_root: /path/to/bazel-testlogs/project/ru
+input_dats:
+  - TestPatternA/test.outputs/chiselsim/TestPatternA/PatternA.AND/random-stream/workdir-verilator/coverage.dat
+  - TestPatternA/test.outputs/chiselsim/TestPatternA/PatternA.OR/random-stream/workdir-verilator/coverage.dat
+  - TestPatternA/test.outputs/chiselsim/TestPatternA/PatternA.XOR/random-stream/workdir-verilator/coverage.dat
+  - TestPatternB/test.outputs/chiselsim/TestPatternB/PatternB.Max/random-stream/workdir-verilator/coverage.dat
+  - TestPatternB/test.outputs/chiselsim/TestPatternB/PatternB.Min/random-stream/workdir-verilator/coverage.dat
+  - TestPatternC/test.outputs/chiselsim/TestPatternC/PatternC/random-stream/workdir-verilator/coverage.dat
+dataset: ru_suite
+sf_alias:
+  - */chiselsim/TestPatternA/PatternA.OR/random-stream=*/chiselsim/TestPatternA/PatternA.AND/random-stream
+  - */chiselsim/TestPatternA/PatternA.XOR/random-stream=*/chiselsim/TestPatternA/PatternA.AND/random-stream
+  - */chiselsim/TestPatternB/PatternB.Min/random-stream=*/chiselsim/TestPatternB/PatternB.Max/random-stream
+exclude_sf:
+  - */chiselsim/TestPatternA/PatternA.AND/random-stream/generated-sources/testbench.sv
+  - */chiselsim/TestPatternB/PatternB.Max/random-stream/generated-sources/testbench.sv
+  - */chiselsim/TestPatternC/PatternC/random-stream/generated-sources/testbench.sv
 ```
 
 Example run:
 
 ```bash
-./convert_coverage_to_coverview.py --args-json coverage_args_ru_suite.json
+uv run ./convert_coverage_to_coverview.py --args-yaml args.yaml
 ```
 
 ## Outputs
@@ -173,8 +172,8 @@ When aliases exist, exclusions are expanded through the alias graph in both dire
 For Bazel users: `SF:` paths can differ between `test.outputs/chiselsim/...` and
 `*_launcher.sh.runfiles/_main/build/chiselsim/...`. Use wildcard-based aliases
 or excludes when you need to match both layouts, e.g.:
-- `--sf-alias '*/chiselsim/TestLogicRU/LogicRU.OR/random-stream=*/chiselsim/TestLogicRU/LogicRU.AND/random-stream'`
-- `--exclude-sf '*/chiselsim/TestLogicRU/LogicRU.AND/random-stream/generated-sources/testbench.sv'`
+- `--sf-alias '*/chiselsim/TestPatternA/PatternA.OR/random-stream=*/chiselsim/TestPatternA/PatternA.AND/random-stream'`
+- `--exclude-sf '*/chiselsim/TestPatternA/PatternA.AND/random-stream/generated-sources/testbench.sv'`
 
 Example:
 - aliases: `A -> B`, `C -> B`

@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import fnmatch
-import json
 import os
 import re
 import shutil
@@ -15,6 +14,17 @@ from collections import defaultdict
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
+
+try:
+    import yaml
+except ModuleNotFoundError:
+    print(
+        "[ERROR] Missing required Python package: pyyaml. "
+        "Install dependencies with: uv sync",
+        file=sys.stderr,
+        flush=True,
+    )
+    raise SystemExit(1)
 
 TOGGLE_INDEXED_PATTERN = re.compile(r"\[(\d+)\]:(0->1|1->0)$")
 TOGGLE_SCALAR_PATTERN = re.compile(r":(0->1|1->0)$")
@@ -36,13 +46,13 @@ def run_cmd(args: list[str]) -> None:
 
 
 def parse_string_list_field(payload: dict[str, object], key: str) -> list[str]:
-    """Read an optional string-list field from JSON object with strict type checks."""
+    """Read an optional string-list field from YAML object with strict type checks."""
     value = payload.get(key, [])
     if value is None:
         return []
     if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
         print(
-            f"[ERROR] JSON field '{key}' must be a string array",
+            f"[ERROR] YAML field '{key}' must be a string array",
             file=sys.stderr,
             flush=True,
         )
@@ -50,28 +60,40 @@ def parse_string_list_field(payload: dict[str, object], key: str) -> list[str]:
     return value
 
 
-def load_args_from_json(json_path: Path) -> list[str]:
+def load_yaml(yaml_path: Path) -> object:
+    """Load args payload from YAML text."""
+    try:
+        raw_text = yaml_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        print(f"[ERROR] YAML args file not found: {yaml_path}", file=sys.stderr, flush=True)
+        raise SystemExit(1)
+    except OSError as exc:
+        print(
+            f"[ERROR] Failed to read YAML args file {yaml_path}: {exc}",
+            file=sys.stderr,
+            flush=True,
+        )
+        raise SystemExit(1)
+
+    try:
+        return yaml.safe_load(raw_text)
+    except yaml.YAMLError as exc:
+        print(f"[ERROR] Invalid YAML in {yaml_path}: {exc}", file=sys.stderr, flush=True)
+        raise SystemExit(1)
+
+
+def load_args_from_yaml(yaml_path: Path) -> list[str]:
     """
-    Convert JSON object into flat CLI args.
+    Convert YAML object into flat CLI args.
 
     Supported schema:
     {input_dats, dataset, dats_root, sf_alias, exclude_sf}
     """
-    try:
-        payload = json.loads(json_path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        print(f"[ERROR] JSON args file not found: {json_path}", file=sys.stderr, flush=True)
-        raise SystemExit(1)
-    except OSError as exc:
-        print(f"[ERROR] Failed to read JSON args file {json_path}: {exc}", file=sys.stderr, flush=True)
-        raise SystemExit(1)
-    except json.JSONDecodeError as exc:
-        print(f"[ERROR] Invalid JSON in {json_path}: {exc}", file=sys.stderr, flush=True)
-        raise SystemExit(1)
+    payload = load_yaml(yaml_path)
 
     if not isinstance(payload, dict):
         print(
-            "[ERROR] JSON args must be an object with keys: "
+            "[ERROR] YAML args must be an object with keys: "
             "input_dats, dataset, dats_root, sf_alias, exclude_sf",
             file=sys.stderr,
             flush=True,
@@ -82,7 +104,7 @@ def load_args_from_json(json_path: Path) -> list[str]:
     unknown_keys = sorted(key for key in payload if key not in allowed_keys)
     if unknown_keys:
         print(
-            "[ERROR] Unsupported key(s) in JSON args: " + ", ".join(unknown_keys),
+            "[ERROR] Unsupported key(s) in YAML args: " + ", ".join(unknown_keys),
             file=sys.stderr,
             flush=True,
         )
@@ -94,14 +116,14 @@ def load_args_from_json(json_path: Path) -> list[str]:
     dataset = payload.get("dataset")
     if dataset is not None:
         if not isinstance(dataset, str):
-            print("[ERROR] JSON field 'dataset' must be a string", file=sys.stderr, flush=True)
+            print("[ERROR] YAML field 'dataset' must be a string", file=sys.stderr, flush=True)
             raise SystemExit(1)
         args.extend(["--dataset", dataset])
 
     dats_root = payload.get("dats_root")
     if dats_root is not None:
         if not isinstance(dats_root, str):
-            print("[ERROR] JSON field 'dats_root' must be a string", file=sys.stderr, flush=True)
+            print("[ERROR] YAML field 'dats_root' must be a string", file=sys.stderr, flush=True)
             raise SystemExit(1)
         args.extend(["--dats-root", dats_root])
 
@@ -113,33 +135,33 @@ def load_args_from_json(json_path: Path) -> list[str]:
     return args
 
 
-def preprocess_argv_with_json(argv: list[str]) -> list[str]:
-    """Expand --args-json before normal argparse parsing."""
+def preprocess_argv_with_yaml(argv: list[str]) -> list[str]:
+    """Expand --args-yaml before normal argparse parsing."""
     if "-h" in argv or "--help" in argv:
         return argv
 
     parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--args-json", action="append", metavar="FILE")
+    parser.add_argument("--args-yaml", action="append", metavar="FILE")
     parsed, filtered = parser.parse_known_args(argv)
 
-    json_paths = parsed.args_json or []
-    if len(json_paths) > 1:
-        print("[ERROR] --args-json can only be provided once", file=sys.stderr, flush=True)
+    yaml_paths = parsed.args_yaml or []
+    if len(yaml_paths) > 1:
+        print("[ERROR] --args-yaml can only be provided once", file=sys.stderr, flush=True)
         raise SystemExit(1)
-    if not json_paths:
+    if not yaml_paths:
         return filtered
 
-    json_args = load_args_from_json(Path(json_paths[0]))
-    if any(item == "--args-json" or item.startswith("--args-json=") for item in json_args):
+    yaml_args = load_args_from_yaml(Path(yaml_paths[0]))
+    if any(item == "--args-yaml" or item.startswith("--args-yaml=") for item in yaml_args):
         print(
-            "[ERROR] Nested --args-json is not supported inside JSON args file",
+            "[ERROR] Nested --args-yaml is not supported inside YAML args file",
             file=sys.stderr,
             flush=True,
         )
         raise SystemExit(1)
 
-    # JSON args are applied first so direct CLI flags can override them.
-    return json_args + filtered
+    # YAML args are applied first so direct CLI flags can override them.
+    return yaml_args + filtered
 
 
 def normalize_coverage_path(path: str) -> str:
@@ -647,17 +669,17 @@ def ensure_lf_lh_summary(info_file: Path) -> None:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     raw_argv = sys.argv[1:] if argv is None else argv
-    effective_argv = preprocess_argv_with_json(raw_argv)
+    effective_argv = preprocess_argv_with_yaml(raw_argv)
 
     parser = argparse.ArgumentParser(
         description="Convert one or more Verilator coverage.dat files into a Coverview input archive."
     )
     parser.add_argument(
-        "--args-json",
+        "--args-yaml",
         default=None,
         metavar="FILE",
         help=(
-            "Load arguments from JSON object file with keys "
+            "Load arguments from YAML object file with keys "
             "{input_dats,dataset,dats_root,sf_alias,exclude_sf}."
         ),
     )
