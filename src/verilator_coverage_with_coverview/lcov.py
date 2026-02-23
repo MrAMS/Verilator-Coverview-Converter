@@ -18,16 +18,22 @@ def apply_sf_aliases(info_file: Path, aliases: list[tuple[str, str]]) -> int:
 
     changed = 0
     output: list[str] = []
-    with info_file.open("r", encoding="utf-8") as file:
-        for line in file:
-            if line.startswith("SF:"):
-                old_path = line[3:].strip()
-                new_path = rewrite_sf_path(old_path, aliases)
-                if new_path != old_path:
-                    changed += 1
-                output.append(f"SF:{new_path}\n")
-            else:
-                output.append(line)
+    lines = info_file.read_text(encoding="utf-8").splitlines(keepends=True)
+    known_paths = {
+        normalize_coverage_path(line[3:])
+        for line in lines
+        if line.startswith("SF:")
+    }
+
+    for line in lines:
+        if line.startswith("SF:"):
+            old_path = line[3:].strip()
+            new_path = rewrite_sf_path(old_path, aliases, allowed_targets=known_paths)
+            if new_path != old_path:
+                changed += 1
+            output.append(f"SF:{new_path}\n")
+        else:
+            output.append(line)
     info_file.write_text("".join(output), encoding="utf-8")
     return changed
 
@@ -167,6 +173,34 @@ def compute_path_rewrite(info_files: list[Path]) -> tuple[str, str]:
     strip_regex = re.escape(prefix) + "/?"
     sources_root = prefix if os.path.isabs(prefix) else os.path.abspath(prefix)
     return strip_regex, sources_root
+
+
+def compute_post_merge_strip_prefix(info_files: list[Path]) -> str:
+    """
+    Compute extra strip prefix after alias merge to improve Coverview tree browsing.
+
+    Dynamic rule: remove only the leading folders that are guaranteed redundant
+    (single-child chain), and keep the first branching folder visible.
+    """
+    sf_paths: list[str] = []
+    for info_file in info_files:
+        sf_paths.extend(collect_sf_paths(info_file))
+    if not sf_paths:
+        return ""
+
+    is_abs_list = [path.startswith("/") for path in sf_paths]
+    if any(is_abs_list) and not all(is_abs_list):
+        return ""
+
+    common_prefix = normalize_coverage_path(os.path.commonpath(sf_paths))
+    if common_prefix in ("", "/"):
+        return ""
+
+    common_prefix = common_prefix.rstrip("/")
+    strip_prefix = os.path.dirname(common_prefix)
+    if strip_prefix in ("", ".", "/"):
+        return ""
+    return normalize_coverage_path(strip_prefix)
 
 
 def ensure_lf_lh_summary(info_file: Path) -> None:

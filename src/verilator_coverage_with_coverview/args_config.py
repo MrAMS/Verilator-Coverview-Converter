@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 from .command_utils import fail
@@ -12,6 +13,15 @@ except ModuleNotFoundError:
     fail("Missing required Python package: pyyaml. Install dependencies with: uv sync")
 
 
+@dataclass(frozen=True)
+class YamlArgs:
+    input_dats: list[str]
+    dataset: str | None
+    dats_root: str | None
+    sf_alias: dict[str, list[str]]
+    exclude_sf: list[str]
+
+
 def parse_string_list_field(payload: dict[str, object], key: str) -> list[str]:
     """Read an optional string-list field from YAML object with strict type checks."""
     value = payload.get(key, [])
@@ -20,6 +30,31 @@ def parse_string_list_field(payload: dict[str, object], key: str) -> list[str]:
     if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
         fail(f"YAML field '{key}' must be a string array")
     return value
+
+
+def parse_string_list_map_field(payload: dict[str, object], key: str) -> dict[str, list[str]]:
+    """
+    Read an optional string->string-list mapping from YAML object.
+
+    Used for grouped sf_alias declarations.
+    """
+    value = payload.get(key, {})
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        fail(f"YAML field '{key}' must be a mapping of group name to string array")
+
+    parsed: dict[str, list[str]] = {}
+    for raw_group, raw_items in value.items():
+        if not isinstance(raw_group, str) or not raw_group.strip():
+            fail(f"YAML field '{key}' group name must be a non-empty string")
+        if not isinstance(raw_items, list) or any(not isinstance(item, str) for item in raw_items):
+            fail(
+                f"YAML field '{key}.{raw_group}' must be a string array "
+                "(first item is canonical path, others are paths or group refs)"
+            )
+        parsed[raw_group.strip()] = raw_items[:]
+    return parsed
 
 
 def load_yaml(yaml_path: Path) -> object:
@@ -37,13 +72,8 @@ def load_yaml(yaml_path: Path) -> object:
         fail(f"Invalid YAML in {yaml_path}: {exc}")
 
 
-def load_args_from_yaml(yaml_path: Path) -> list[str]:
-    """
-    Convert YAML object into flat CLI args.
-
-    Supported schema:
-    {input_dats, dataset, dats_root, sf_alias, exclude_sf}
-    """
+def load_args_from_yaml(yaml_path: Path) -> YamlArgs:
+    """Load structured YAML args payload."""
     payload = load_yaml(yaml_path)
 
     if not isinstance(payload, dict):
@@ -57,112 +87,51 @@ def load_args_from_yaml(yaml_path: Path) -> list[str]:
     if unknown_keys:
         fail("Unsupported key(s) in YAML args: " + ", ".join(unknown_keys))
 
-    args: list[str] = []
-    args.extend(parse_string_list_field(payload, "input_dats"))
-
     dataset = payload.get("dataset")
     if dataset is not None:
         if not isinstance(dataset, str):
             fail("YAML field 'dataset' must be a string")
-        args.extend(["--dataset", dataset])
 
     dats_root = payload.get("dats_root")
     if dats_root is not None:
         if not isinstance(dats_root, str):
             fail("YAML field 'dats_root' must be a string")
-        args.extend(["--dats-root", dats_root])
 
-    for alias in parse_string_list_field(payload, "sf_alias"):
-        args.extend(["--sf-alias", alias])
-    for path in parse_string_list_field(payload, "exclude_sf"):
-        args.extend(["--exclude-sf", path])
-
-    return args
-
-
-def preprocess_argv_with_yaml(argv: list[str]) -> list[str]:
-    """Expand --args-yaml before normal argparse parsing."""
-    if "-h" in argv or "--help" in argv:
-        return argv
-
-    parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--args-yaml", action="append", metavar="FILE")
-    parsed, filtered = parser.parse_known_args(argv)
-
-    yaml_paths = parsed.args_yaml or []
-    if len(yaml_paths) > 1:
-        fail("--args-yaml can only be provided once")
-    if not yaml_paths:
-        return filtered
-
-    yaml_args = load_args_from_yaml(Path(yaml_paths[0]))
-    if any(item == "--args-yaml" or item.startswith("--args-yaml=") for item in yaml_args):
-        fail("Nested --args-yaml is not supported inside YAML args file")
-
-    # YAML args are applied first so direct CLI flags can override them.
-    return yaml_args + filtered
+    return YamlArgs(
+        input_dats=parse_string_list_field(payload, "input_dats"),
+        dataset=dataset,
+        dats_root=dats_root,
+        sf_alias=parse_string_list_map_field(payload, "sf_alias"),
+        exclude_sf=parse_string_list_field(payload, "exclude_sf"),
+    )
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     raw_argv = sys.argv[1:] if argv is None else argv
-    effective_argv = preprocess_argv_with_yaml(raw_argv)
 
     parser = argparse.ArgumentParser(
         prog="convert-coverage-to-coverview",
-        description="Convert one or more Verilator coverage.dat files into a Coverview input archive.",
+        description="Convert Verilator coverage.dat files into a Coverview input archive using YAML config.",
     )
     parser.add_argument(
         "--args-yaml",
-        default=None,
+        required=True,
         metavar="FILE",
         help=(
             "Load arguments from YAML object file with keys "
             "{input_dats,dataset,dats_root,sf_alias,exclude_sf}."
         ),
     )
-    parser.add_argument(
-        "input_dats",
-        nargs="*",
-        help="Input coverage.dat paths; pass multiple files to merge their coverage.",
+    args = parser.parse_args(raw_argv)
+    yaml_args = load_args_from_yaml(Path(args.args_yaml))
+
+    return argparse.Namespace(
+        input_dats=yaml_args.input_dats,
+        dataset=yaml_args.dataset,
+        dats_root=yaml_args.dats_root,
+        sf_alias=yaml_args.sf_alias,
+        exclude_sf=yaml_args.exclude_sf,
     )
-    parser.add_argument(
-        "-d",
-        "--dataset",
-        default=None,
-        help="Dataset name for output files (default: verilator).",
-    )
-    parser.add_argument(
-        "--dats-root",
-        default=None,
-        metavar="DIR",
-        help=(
-            "Optional common prefix for input dat paths. "
-            "Relative input_dats are resolved under this directory."
-        ),
-    )
-    parser.add_argument(
-        "--sf-alias",
-        action="append",
-        default=[],
-        metavar="FROM=TO",
-        help=(
-            "Map equivalent source paths (can be repeated). "
-            "When SF is FROM or starts with FROM/, it will be rewritten to TO. "
-            "Supports '*' wildcard (same count required on both sides)."
-        ),
-    )
-    parser.add_argument(
-        "--exclude-sf",
-        action="append",
-        default=[],
-        metavar="PATH",
-        help=(
-            "Exclude the specified SF path from output coverage (repeatable). "
-            "Supports '*' wildcard. When combined with --sf-alias, "
-            "equivalent aliased paths are also excluded."
-        ),
-    )
-    return parser.parse_args(effective_argv)
 
 
 def resolve_input_dat_path(raw_path: str, dats_root: Path | None) -> Path:

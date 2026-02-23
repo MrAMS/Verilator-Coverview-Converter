@@ -84,6 +84,72 @@ def rewrite_path_by_prefix(path: str, src: str, dst: str) -> str | None:
     return rewrite_path_by_exact_prefix(path, src, dst)
 
 
+def extract_tail_by_prefix_pattern(path: str, pattern: str) -> str | None:
+    """Return path tail ('' or '/...') if path matches pattern as a prefix."""
+    if not pattern:
+        return None
+
+    if "*" in pattern:
+        matched = compile_wildcard_prefix_regex(pattern).match(path)
+        if matched is None:
+            return None
+        return matched.group("tail") or ""
+
+    if path == pattern:
+        return ""
+    prefix = "/" if pattern == "/" else pattern + "/"
+    if path.startswith(prefix):
+        return path[len(pattern) :]
+    return None
+
+
+def find_existing_rewrite_target(
+    path: str,
+    src: str,
+    dst: str,
+    allowed_targets: set[str],
+) -> str | None:
+    """
+    Resolve alias by matching suffix under destination roots that already exist.
+
+    This is needed when source and destination live under different launcher prefixes.
+    """
+    tail = extract_tail_by_prefix_pattern(path, src)
+    if tail is None:
+        return None
+
+    candidates: list[str] = []
+    for target in allowed_targets:
+        target_tail = extract_tail_by_prefix_pattern(target, dst)
+        if target_tail == tail:
+            candidates.append(target)
+
+    if not candidates:
+        return None
+    if len(candidates) == 1:
+        return candidates[0]
+
+    # Prefer the candidate that shares the most path prefix with source.
+    # If still ambiguous, fail to avoid silently merging to wrong target.
+    scored = sorted(
+        (
+            (len(os.path.commonprefix([candidate, path])), candidate)
+            for candidate in candidates
+        ),
+        reverse=True,
+    )
+    best_score = scored[0][0]
+    best = sorted(candidate for score, candidate in scored if score == best_score)
+    if len(best) == 1:
+        return best[0]
+
+    fail(
+        "Ambiguous sf_alias target resolution for path "
+        f"'{path}' via rule '{src} -> {dst}'. Candidates: {', '.join(best)}. "
+        "Please make sf_alias patterns more specific."
+    )
+
+
 def matches_excluded_pattern(path: str, pattern: str) -> bool:
     """
     Match one SF path against an exclude pattern.
@@ -99,33 +165,170 @@ def matches_excluded_pattern(path: str, pattern: str) -> bool:
     return normalized_path == normalized_pattern
 
 
-def parse_sf_aliases(raw_aliases: list[str]) -> list[tuple[str, str]]:
+def validate_alias_pair(src: str, dst: str, context: str) -> None:
+    src_wildcards = src.count("*")
+    dst_wildcards = dst.count("*")
+    if src_wildcards != dst_wildcards:
+        fail(
+            f"Invalid sf_alias rule '{context}': wildcard count must match "
+            f"('{src}' -> '{dst}')"
+        )
+
+
+def validate_group_cycles(group_refs: dict[str, set[str]]) -> None:
+    state: dict[str, int] = {}
+    stack: list[str] = []
+    index_by_group: dict[str, int] = {}
+
+    def dfs(group: str) -> None:
+        state[group] = 1
+        index_by_group[group] = len(stack)
+        stack.append(group)
+        for ref in sorted(group_refs[group]):
+            ref_state = state.get(ref, 0)
+            if ref_state == 0:
+                dfs(ref)
+            elif ref_state == 1:
+                cycle = stack[index_by_group[ref] :] + [ref]
+                fail("Detected sf_alias group cycle: " + " -> ".join(cycle))
+        stack.pop()
+        index_by_group.pop(group, None)
+        state[group] = 2
+
+    for group in sorted(group_refs):
+        if state.get(group, 0) == 0:
+            dfs(group)
+
+
+def parse_sf_alias_groups(raw_groups: dict[str, list[str]]) -> list[tuple[str, str]]:
+    """
+    Parse grouped sf_alias config.
+
+    YAML format:
+      sf_alias:
+        group_name:
+          - canonical_path
+          - other_path_or_group_name
+          - ...
+
+    Each item is merged into the first item (canonical path).
+    """
+    if not raw_groups:
+        return []
+
+    group_names = set(raw_groups.keys())
+    canonical_by_group: dict[str, str] = {}
+    group_refs: dict[str, set[str]] = {name: set() for name in group_names}
     aliases: list[tuple[str, str]] = []
-    for item in raw_aliases:
-        if "=" not in item:
-            fail(f"Invalid --sf-alias '{item}', expected FROM=TO")
-        src, dst = item.split("=", 1)
-        src = normalize_coverage_path(src)
-        dst = normalize_coverage_path(dst)
-        if not src:
-            fail(f"Invalid --sf-alias '{item}', FROM cannot be empty")
-        src_wildcards = src.count("*")
-        dst_wildcards = dst.count("*")
-        if src_wildcards != dst_wildcards:
-            fail(f"Invalid --sf-alias '{item}', wildcard count must match on both sides")
-        aliases.append((src, dst))
+
+    for group, items in raw_groups.items():
+        if not items:
+            fail(f"Invalid sf_alias group '{group}': must contain at least one item")
+
+        canonical_raw = items[0]
+        canonical = normalize_coverage_path(canonical_raw)
+        if not canonical:
+            fail(f"Invalid sf_alias group '{group}': canonical path cannot be empty")
+        if canonical in group_names:
+            fail(
+                f"Invalid sf_alias group '{group}': first item '{canonical_raw}' "
+                "cannot be another group name"
+            )
+        canonical_by_group[group] = canonical
+
+    for group, items in raw_groups.items():
+        dst = canonical_by_group[group]
+        for item in items[1:]:
+            normalized_item = normalize_coverage_path(item)
+            if not normalized_item:
+                fail(f"Invalid sf_alias group '{group}': item cannot be empty")
+
+            if normalized_item in group_names:
+                ref_group = normalized_item
+                group_refs[group].add(ref_group)
+                src = canonical_by_group[ref_group]
+                context = f"{group}<-{ref_group}"
+            else:
+                src = normalized_item
+                context = f"{group}<-{item}"
+
+            validate_alias_pair(src, dst, context)
+            aliases.append((src, dst))
+
+    validate_group_cycles(group_refs)
+
+    source_to_target: dict[str, str] = {}
+    deduped: list[tuple[str, str]] = []
+    for src, dst in aliases:
+        if src == dst:
+            continue
+        previous = source_to_target.get(src)
+        if previous is not None and previous != dst:
+            fail(
+                "Conflicting sf_alias rules for source "
+                f"'{src}': '{previous}' vs '{dst}'"
+            )
+        if previous is None:
+            source_to_target[src] = dst
+            deduped.append((src, dst))
 
     # Prefer more specific source patterns first (longer non-wildcard text wins).
-    aliases.sort(key=lambda pair: len(pair[0].replace("*", "")), reverse=True)
-    return aliases
+    deduped.sort(key=lambda pair: len(pair[0].replace("*", "")), reverse=True)
+    return deduped
 
 
-def rewrite_sf_path(path: str, aliases: list[tuple[str, str]]) -> str:
+def rewrite_sf_path_once(path: str, aliases: list[tuple[str, str]]) -> str:
+    return rewrite_sf_path_once_with_targets(path, aliases, allowed_targets=None)
+
+
+def rewrite_sf_path_once_with_targets(
+    path: str,
+    aliases: list[tuple[str, str]],
+    allowed_targets: set[str] | None,
+) -> str:
     for src, dst in aliases:
         rewritten = rewrite_path_by_prefix(path, src, dst)
-        if rewritten is not None:
-            return rewritten
+        if rewritten is not None and rewritten != path:
+            if allowed_targets is None:
+                return rewritten
+            if rewritten in allowed_targets:
+                return rewritten
+            existing = find_existing_rewrite_target(path, src, dst, allowed_targets)
+            if existing is not None and existing != path:
+                return existing
+            continue
+
+        if allowed_targets is not None:
+            existing = find_existing_rewrite_target(path, src, dst, allowed_targets)
+            if existing is not None and existing != path:
+                return existing
     return path
+
+
+def rewrite_sf_path(
+    path: str,
+    aliases: list[tuple[str, str]],
+    allowed_targets: set[str] | None = None,
+) -> str:
+    if not aliases:
+        return path
+
+    current = path
+    chain = [current]
+    index_by_path = {current: 0}
+
+    while True:
+        rewritten = rewrite_sf_path_once_with_targets(current, aliases, allowed_targets)
+        if rewritten == current:
+            break
+        if rewritten in index_by_path:
+            cycle = chain[index_by_path[rewritten] :] + [rewritten]
+            fail("Detected sf_alias rewrite cycle: " + " -> ".join(cycle))
+        current = rewritten
+        index_by_path[current] = len(chain)
+        chain.append(current)
+
+    return current
 
 
 def parse_excluded_sf_paths(raw_paths: list[str]) -> list[str]:
