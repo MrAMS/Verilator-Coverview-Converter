@@ -16,7 +16,7 @@ from .lcov import (
     transform_info_file,
 )
 from .models import build_output_files
-from .path_alias import expand_excluded_sf_paths, parse_excluded_sf_paths, parse_sf_alias_groups
+from .path_alias import parse_excluded_sf_paths, parse_sf_alias_groups
 from .toggle_labels import load_toggle_name_map, rewrite_toggle_brda_names
 
 
@@ -25,12 +25,10 @@ def main(argv: list[str] | None = None) -> int:
 
     # Parse alias/exclude intent once, then reuse across line/toggle/user stages.
     sf_aliases = parse_sf_alias_groups(args.sf_alias)
-    excluded_sf_paths = expand_excluded_sf_paths(
-        parse_excluded_sf_paths(args.exclude_sf), sf_aliases
-    )
-    if excluded_sf_paths:
-        log(f"[0/10] Exclude SF paths: {len(excluded_sf_paths)} (after alias expansion)")
-        for path in sorted(excluded_sf_paths):
+    excluded_sf_patterns = parse_excluded_sf_paths(args.exclude_sf)
+    if excluded_sf_patterns:
+        log(f"[0/10] Exclude SF patterns: {len(excluded_sf_patterns)}")
+        for path in excluded_sf_patterns:
             log(f"      - {path}")
 
     input_dats, dataset = resolve_inputs_and_dataset(args)
@@ -97,7 +95,7 @@ def main(argv: list[str] | None = None) -> int:
         outputs.line_info,
         coverage_label="line",
         sf_aliases=sf_aliases,
-        excluded_sf_paths=excluded_sf_paths,
+        excluded_sf_patterns=excluded_sf_patterns,
     )
     ensure_lf_lh_summary(outputs.line_info)
 
@@ -115,7 +113,7 @@ def main(argv: list[str] | None = None) -> int:
         outputs.toggle_info,
         coverage_label="toggle",
         sf_aliases=sf_aliases,
-        excluded_sf_paths=excluded_sf_paths,
+        excluded_sf_patterns=excluded_sf_patterns,
         set_block_ids=True,
     )
 
@@ -129,7 +127,7 @@ def main(argv: list[str] | None = None) -> int:
             outputs.user_info,
             coverage_label="user",
             sf_aliases=sf_aliases,
-            excluded_sf_paths=excluded_sf_paths,
+            excluded_sf_patterns=excluded_sf_patterns,
         )
         coverage_files.append(outputs.user_info)
     else:

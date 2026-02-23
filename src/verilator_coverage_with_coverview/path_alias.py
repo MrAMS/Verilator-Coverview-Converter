@@ -277,10 +277,6 @@ def parse_sf_alias_groups(raw_groups: dict[str, list[str]]) -> list[tuple[str, s
     return deduped
 
 
-def rewrite_sf_path_once(path: str, aliases: list[tuple[str, str]]) -> str:
-    return rewrite_sf_path_once_with_targets(path, aliases, allowed_targets=None)
-
-
 def rewrite_sf_path_once_with_targets(
     path: str,
     aliases: list[tuple[str, str]],
@@ -305,13 +301,14 @@ def rewrite_sf_path_once_with_targets(
     return path
 
 
-def rewrite_sf_path(
+def rewrite_sf_path_chain(
     path: str,
     aliases: list[tuple[str, str]],
     allowed_targets: set[str] | None = None,
-) -> str:
+) -> list[str]:
+    """Return transitive rewrite chain, starting with original path."""
     if not aliases:
-        return path
+        return [path]
 
     current = path
     chain = [current]
@@ -328,7 +325,15 @@ def rewrite_sf_path(
         index_by_path[current] = len(chain)
         chain.append(current)
 
-    return current
+    return chain
+
+
+def rewrite_sf_path(
+    path: str,
+    aliases: list[tuple[str, str]],
+    allowed_targets: set[str] | None = None,
+) -> str:
+    return rewrite_sf_path_chain(path, aliases, allowed_targets)[-1]
 
 
 def parse_excluded_sf_paths(raw_paths: list[str]) -> list[str]:
@@ -341,28 +346,3 @@ def parse_excluded_sf_paths(raw_paths: list[str]) -> list[str]:
 
     # Keep input order while removing duplicates.
     return list(dict.fromkeys(parsed_paths))
-
-
-def expand_excluded_sf_paths(base_paths: list[str], aliases: list[tuple[str, str]]) -> set[str]:
-    """
-    Expand excludes through alias graph (both directions, transitively).
-
-    Example:
-      A->B and C->B, exclude C/foo.sv
-      => also exclude B/foo.sv and A/foo.sv.
-    """
-    expanded: set[str] = set()
-    for base in base_paths:
-        queue = [base]
-        seen = {base}
-        while queue:
-            current = queue.pop()
-            for src, dst in aliases:
-                for left, right in ((src, dst), (dst, src)):
-                    rewritten = rewrite_path_by_prefix(current, left, right)
-                    if rewritten is None or rewritten in seen:
-                        continue
-                    seen.add(rewritten)
-                    queue.append(rewritten)
-        expanded.update(seen)
-    return expanded
