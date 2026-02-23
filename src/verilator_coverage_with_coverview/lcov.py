@@ -14,179 +14,89 @@ from .path_alias import (
 
 
 @dataclass(frozen=True)
-class SfRecordSignature:
-    da_lines: frozenset[int]
-    brda_points: frozenset[tuple[int, str]]
-    fn_points: frozenset[tuple[int, str]]
-
-
-@dataclass(frozen=True)
 class AliasApplyResult:
     rewritten_sf: int
-    blocked_incompatible: int
+    dropped_parent_records: int
     alias_map: dict[str, str]
-
-
-def parse_int_prefix(payload: str) -> int | None:
-    head, *_ = payload.split(",", 1)
-    try:
-        return int(head)
-    except ValueError:
-        return None
-
-
-def collect_sf_signatures(lines: list[str]) -> dict[str, SfRecordSignature]:
-    signatures: dict[str, dict[str, set]] = {}
-    current_sf = ""
-    current_da: set[int] = set()
-    current_brda: set[tuple[int, str]] = set()
-    current_fn: set[tuple[int, str]] = set()
-
-    def flush_current() -> None:
-        nonlocal current_sf, current_da, current_brda, current_fn
-        if not current_sf:
-            return
-        bucket = signatures.setdefault(
-            current_sf,
-            {"da": set(), "brda": set(), "fn": set()},
-        )
-        bucket["da"].update(current_da)
-        bucket["brda"].update(current_brda)
-        bucket["fn"].update(current_fn)
-        current_sf = ""
-        current_da = set()
-        current_brda = set()
-        current_fn = set()
-
-    for line in lines:
-        if line.startswith("SF:"):
-            flush_current()
-            current_sf = normalize_coverage_path(line[3:])
-            continue
-
-        if not current_sf:
-            continue
-
-        if line.startswith("DA:"):
-            line_no = parse_int_prefix(line[3:].strip())
-            if line_no is not None:
-                current_da.add(line_no)
-            continue
-
-        if line.startswith("BRDA:"):
-            parts = line[5:].strip().split(",", 3)
-            if len(parts) == 4:
-                try:
-                    line_no = int(parts[0])
-                except ValueError:
-                    line_no = None
-                if line_no is not None:
-                    current_brda.add((line_no, parts[2]))
-            continue
-
-        if line.startswith("FN:"):
-            parts = line[3:].strip().split(",", 1)
-            if len(parts) == 2:
-                try:
-                    line_no = int(parts[0])
-                except ValueError:
-                    line_no = None
-                if line_no is not None:
-                    current_fn.add((line_no, parts[1]))
-            continue
-
-        if line.startswith("end_of_record"):
-            flush_current()
-
-    flush_current()
-
-    return {
-        sf: SfRecordSignature(
-            da_lines=frozenset(payload["da"]),
-            brda_points=frozenset(payload["brda"]),
-            fn_points=frozenset(payload["fn"]),
-        )
-        for sf, payload in signatures.items()
-    }
-
-
-def signatures_compatible(left: SfRecordSignature, right: SfRecordSignature) -> bool:
-    if not (
-        left.da_lines
-        or right.da_lines
-        or left.brda_points
-        or right.brda_points
-        or left.fn_points
-        or right.fn_points
-    ):
-        return False
-    if (left.da_lines or right.da_lines) and left.da_lines != right.da_lines:
-        return False
-    if (left.brda_points or right.brda_points) and left.brda_points != right.brda_points:
-        return False
-    if (left.fn_points or right.fn_points) and left.fn_points != right.fn_points:
-        return False
-    return True
 
 
 def resolve_sf_alias_map(
     known_paths: set[str],
     aliases: list[tuple[str, str]],
-    signatures: dict[str, SfRecordSignature],
-) -> tuple[dict[str, str], int]:
+) -> dict[str, str]:
     mapping: dict[str, str] = {}
-    blocked = 0
 
     for path in sorted(known_paths):
         chain = rewrite_sf_path_chain(path, aliases, allowed_targets=known_paths)
-        if len(chain) == 1:
-            mapping[path] = path
-            continue
+        mapping[path] = chain[-1]
 
-        src_sig = signatures.get(path)
-        chosen = path
-        for candidate in chain[1:]:
-            dst_sig = signatures.get(candidate)
-            if src_sig is None or dst_sig is None:
-                continue
-            if signatures_compatible(src_sig, dst_sig):
-                chosen = candidate
+    return mapping
 
-        mapping[path] = chosen
-        if chosen != chain[-1]:
-            blocked += 1
 
-    return mapping, blocked
+def collect_shadowed_targets(alias_map: dict[str, str]) -> set[str]:
+    """
+    Collect target SFs that should drop their parent record.
+
+    In hierarchical aggregation mode, if any child path maps to target T, then
+    original record on T is dropped and replaced by aggregated child coverage.
+    """
+    return {dst for src, dst in alias_map.items() if src != dst}
 
 
 def apply_sf_aliases(info_file: Path, aliases: list[tuple[str, str]]) -> AliasApplyResult:
     if not aliases:
-        return AliasApplyResult(rewritten_sf=0, blocked_incompatible=0, alias_map={})
+        return AliasApplyResult(rewritten_sf=0, dropped_parent_records=0, alias_map={})
 
-    changed = 0
-    output: list[str] = []
     lines = info_file.read_text(encoding="utf-8").splitlines(keepends=True)
-    known_paths = {
-        normalize_coverage_path(line[3:])
-        for line in lines
-        if line.startswith("SF:")
-    }
-    signatures = collect_sf_signatures(lines)
-    alias_map, blocked = resolve_sf_alias_map(known_paths, aliases, signatures)
+    known_paths = {normalize_coverage_path(line[3:]) for line in lines if line.startswith("SF:")}
+    alias_map = resolve_sf_alias_map(known_paths, aliases)
+    shadowed_targets = collect_shadowed_targets(alias_map)
 
-    for line in lines:
-        if line.startswith("SF:"):
-            old_path = normalize_coverage_path(line[3:])
+    rewritten_sf = 0
+    dropped_parent_records = 0
+    output: list[str] = []
+    record: list[str] = []
+    record_sf = ""
+
+    def flush_record() -> None:
+        nonlocal rewritten_sf, dropped_parent_records, record, record_sf
+        if not record:
+            return
+
+        normalized_sf = normalize_coverage_path(record_sf)
+        if normalized_sf and normalized_sf in shadowed_targets:
+            dropped_parent_records += 1
+            record = []
+            record_sf = ""
+            return
+
+        for item in record:
+            if not item.startswith("SF:"):
+                output.append(item)
+                continue
+            old_path = normalize_coverage_path(item[3:])
             new_path = alias_map.get(old_path, old_path)
             if new_path != old_path:
-                changed += 1
+                rewritten_sf += 1
             output.append(f"SF:{new_path}\n")
-        else:
-            output.append(line)
+
+        record = []
+        record_sf = ""
+
+    for line in lines:
+        record.append(line)
+        if line.startswith("SF:"):
+            record_sf = line[3:].strip()
+            continue
+        if line.startswith("end_of_record"):
+            flush_record()
+
+    flush_record()
+
     info_file.write_text("".join(output), encoding="utf-8")
     return AliasApplyResult(
-        rewritten_sf=changed,
-        blocked_incompatible=blocked,
+        rewritten_sf=rewritten_sf,
+        dropped_parent_records=dropped_parent_records,
         alias_map=alias_map,
     )
 
@@ -244,8 +154,8 @@ def expand_excluded_paths_for_alias_map(
     """
     Expand exclude patterns through effective alias edges for this LCOV file.
 
-    Expansion is performed only on aliases that were actually applied (or
-    considered) in this file, so incompatible alias edges do not over-exclude.
+    Expansion is performed only on aliases discovered in this LCOV file, so
+    unrelated configured alias edges do not over-exclude.
     """
     if not base_patterns:
         return set()
@@ -464,19 +374,14 @@ def apply_alias_and_exclusions(
     if sf_aliases:
         alias_result = apply_sf_aliases(info_file, sf_aliases)
         alias_map = alias_result.alias_map
-        if alias_result.rewritten_sf:
+        if alias_result.rewritten_sf or alias_result.dropped_parent_records:
             # Re-run transform after alias rewrite so info-process can merge records.
             transform_info_file(info_file, strip_regex="", set_block_ids=set_block_ids)
             dropped, mismatched = squash_duplicate_sf_headers(info_file)
             log(
                 f"      applied SF aliases on {coverage_label} info (rewritten SF: {alias_result.rewritten_sf}, "
-                f"blocked incompatible: {alias_result.blocked_incompatible}, "
+                f"dropped parent records: {alias_result.dropped_parent_records}, "
                 f"dropped extra SF: {dropped}, mismatched: {mismatched})"
-            )
-        elif alias_result.blocked_incompatible:
-            log(
-                f"      SF aliases on {coverage_label} info found {alias_result.blocked_incompatible} "
-                "incompatible target(s); kept original SF for accuracy"
             )
         else:
             log(f"      SF aliases configured for {coverage_label} info but no path matched")

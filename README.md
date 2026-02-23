@@ -10,7 +10,7 @@ Convert one or more [Verilator](https://www.veripool.org/verilator/) `coverage.d
 
 - Merge multiple test runs into one dataset.
 - Generate line / toggle / user coverage LCOV files.
-- Merge equivalent `SF` paths via grouped `sf_alias` with transitive propagation.
+- Perform hierarchical aggregation via grouped `sf_alias` with transitive propagation.
 - Expand `exclude_sf` through effective alias relations (bi-directional + transitive).
 - Dynamically remove redundant single-child folder prefixes for easier Coverview browsing.
 
@@ -104,9 +104,10 @@ exclude_sf:
 
 ## Merge Accuracy Rules
 
-- **File-wise merge**: merge is done per concrete `SF` file path.
+- **Hierarchical aggregation**: `sf_alias` is treated as child-to-parent aggregation, not source-equivalence.
+- **File-wise aggregation**: aggregation is performed per concrete `SF` file path.
+- **Parent shadowing**: if any child maps to parent file `P`, original record on `P` is dropped, then child records are merged into `P`.
 - **Cross-layout safety**: for different launcher path layouts, alias target is resolved from existing `SF` entries in the current LCOV file.
-- **Compatibility gate**: transitive alias only proceeds when source/target LCOV signatures are compatible (line/branch/function structure match). Incompatible hops are automatically skipped.
 - **Ambiguity protection**: if multiple equally plausible alias targets exist, conversion fails explicitly (no silent wrong merge).
 - **Exclude consistency**: `exclude_sf` is expanded via effective alias edges in both directions and transitively.
 
