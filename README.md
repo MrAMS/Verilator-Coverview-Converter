@@ -12,6 +12,8 @@ Convert one or more [Verilator](https://www.veripool.org/verilator/) `coverage.d
 - Generate line / toggle / user coverage LCOV files.
 - Perform hierarchical aggregation via grouped `sf_alias` with transitive propagation.
 - Expand `exclude_sf` through effective alias relations (bi-directional + transitive).
+- Use EDA-style point-level merge (hit-count accumulation + covered-if-hit).
+- Validate alias model compatibility (DA/BRDA/FN point-set equality) and fail fast on mismatch.
 - Dynamically remove redundant single-child folder prefixes for easier Coverview browsing.
 
 ## Requirements
@@ -104,10 +106,11 @@ exclude_sf:
 
 ## Merge Accuracy Rules
 
-- **Hierarchical aggregation**: `sf_alias` is treated as child-to-parent aggregation, not source-equivalence.
-- **File-wise aggregation**: aggregation is performed per concrete `SF` file path.
-- **Parent shadowing**: if any child maps to parent file `P`, original record on `P` is dropped, then child records are merged into `P`.
+- **EDA-style point merge**: aliased records are merged by coverage point; hit counts are accumulated, and a point is covered if merged hit > 0.
+- **Hierarchical alias graph**: `sf_alias` defines child-to-parent mapping with transitive propagation.
+- **File-wise mapping**: mapping is resolved per concrete `SF` path.
 - **Cross-layout safety**: for different launcher path layouts, alias target is resolved from existing `SF` entries in the current LCOV file.
+- **Fail-fast mismatch guard**: before merge, source/target point models must match (`DA/BRDA/FN` set equality), otherwise conversion exits with explicit diffs.
 - **Ambiguity protection**: if multiple equally plausible alias targets exist, conversion fails explicitly (no silent wrong merge).
 - **Exclude consistency**: `exclude_sf` is expanded via effective alias edges in both directions and transitively.
 

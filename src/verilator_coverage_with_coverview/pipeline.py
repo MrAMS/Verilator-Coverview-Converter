@@ -114,7 +114,6 @@ def main(argv: list[str] | None = None) -> int:
         coverage_label="toggle",
         sf_aliases=sf_aliases,
         excluded_sf_patterns=excluded_sf_patterns,
-        set_block_ids=True,
     )
 
     # Stage 5: optional user coverage pipeline.

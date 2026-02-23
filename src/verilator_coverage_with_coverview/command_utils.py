@@ -5,7 +5,7 @@ import subprocess
 import sys
 from typing import NoReturn
 
-TRANSFORM_BASE_ARGS = ["info-process", "transform", "--normalize-paths", "--normalize-hit-counts"]
+TRANSFORM_BASE_ARGS = ["info-process", "transform", "--normalize-paths"]
 
 
 def log(message: str) -> None:
